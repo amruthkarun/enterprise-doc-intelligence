@@ -118,7 +118,7 @@ This script will:
 
 * Parse PDFs
 * Split text into chunks
-* Generate embeddings with `all-MiniLM-L6-v2`
+* Generate embeddings with `BAAI/bge-base-en-v1.5`
 * Save them into `chroma_db/`
 
 ---
