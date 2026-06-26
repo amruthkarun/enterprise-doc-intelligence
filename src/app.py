@@ -80,12 +80,26 @@ def search(query, authorized_companies, k=5):
 
 
 # ------------------- Streamlit UI -------------------
-st.set_page_config(page_title="Enterprise Document Intelligence Platform", layout="wide")
+st.set_page_config(page_title="Enterprise Document Intelligence Platform", page_icon="🏢", layout="wide")
 st.title("🏢 Enterprise Document Intelligence Platform")
+st.markdown(
+    """
+    Welcome to the Enterprise Document Intelligence platform. Login with your corporate email to search authorized transcripts,
+    find relevant excerpts, and keep a history of your questions.
+    """
+)
 
-# Simulate Login
+# Sidebar login and status
 st.sidebar.header("User Login")
-user_email = st.sidebar.text_input("Enter Email", value="")
+st.sidebar.write("Sign in to access your authorized transcripts and document intelligence tools.")
+user_email = st.sidebar.text_input("Email", value="", placeholder="name@example.com")
+
+if "chat_histories" not in st.session_state:
+    st.session_state.chat_histories = {}
+if "query" not in st.session_state:
+    st.session_state.query = ""
+if "last_results" not in st.session_state:
+    st.session_state.last_results = []
 
 if user_email:
     authorized_companies = get_user_access(user_email)
@@ -93,45 +107,83 @@ if user_email:
     if not authorized_companies:
         st.sidebar.error("❌ Access Denied. No documents available for this user.")
     else:
-        st.sidebar.success(f"✅ Access Granted for: {', '.join(authorized_companies)}")
-
-        # Initialize chat history per user
-        if "chat_histories" not in st.session_state:
-            st.session_state.chat_histories = {}
+        st.sidebar.success("✅ Access Granted")
+        st.sidebar.markdown("**Authorized Documents**")
+        for company in authorized_companies:
+            st.sidebar.write(f"- {company}")
+        st.sidebar.markdown("---")
+        if st.sidebar.button("Reset Session"):
+            st.session_state.chat_histories[user_email] = []
+            st.session_state.last_results = []
+            st.session_state.query = ""
+            st.sidebar.success("Session reset. You can start fresh.")
+        st.sidebar.info("Ask about earnings, strategy, risks, or other topics covered in your authorized documents.")
 
         if user_email not in st.session_state.chat_histories:
             st.session_state.chat_histories[user_email] = []
 
         chat_history = st.session_state.chat_histories[user_email]
 
-        st.subheader(f"🔎 Query Documents ({', '.join(authorized_companies)})")
+        left_col, right_col = st.columns((2.5, 1))
 
-        query = st.text_input("Enter your query:")
+        with left_col:
+            st.subheader(f"🔎 Query Documents ({', '.join(authorized_companies)})")
+            with st.form(key="query_form"):
+                query = st.text_input(
+                    "Enter your question",
+                    value=st.session_state.query,
+                    placeholder="What are the latest earnings highlights?"
+                )
+                search_button = st.form_submit_button("Search")
 
-        if st.button("Search"):
-            if query:
-                chat_history.append({"role": "user", "content": query})
+                if search_button:
+                    st.session_state.query = query
+                    if query.strip():
+                        chat_history.append({"role": "user", "content": query})
+                        search_results = search(query, authorized_companies)
+                        st.session_state.last_results = search_results
 
-                search_results = search(query, authorized_companies)
+                        if search_results:
+                            for result in search_results:
+                                chat_history.append({"role": "assistant", "content": result['content']})
+                        else:
+                            st.warning("No relevant information found.")
+                            chat_history.append({"role": "assistant", "content": "No relevant information found."})
+                    else:
+                        st.warning("Please enter a question before searching.")
 
-                if search_results:
-                    for result in search_results:
-                        st.markdown(f"**Company:** {result['company']}")
-                        st.markdown(f"**Excerpt:** {result['content']}")
-                        st.markdown("---")
-                        chat_history.append({"role": "assistant", "content": result['content']})
-                else:
-                    st.warning("No relevant information found.")
-                    chat_history.append({"role": "assistant", "content": "No relevant information found."})
-
-        # Reset Chat Button
-        if st.sidebar.button("Reset Chat"):
-            st.session_state.chat_histories[user_email] = []
-            st.sidebar.success("Chat history cleared. You can start fresh.")
-
-        # Display chat history
-        st.subheader("🗂️ Conversation History")
-        for chat in chat_history:
-            role = "👤 You" if chat["role"] == "user" else "🤖 Assistant"
-            st.markdown(f"**{role}:** {chat['content']}")
             st.markdown("---")
+            st.subheader("📄 Search Results")
+            if st.session_state.last_results:
+                for result in st.session_state.last_results:
+                    with st.expander(f"{result['company']}", expanded=False):
+                        st.write(result['content'])
+            else:
+                st.info("Search results will appear here after you submit a query.")
+
+        with right_col:
+            st.subheader("📌 Quick Overview")
+            st.metric("Authorized Documents", len(authorized_companies))
+            st.metric("History Entries", len(chat_history))
+            st.markdown(
+                """
+                **Tips:**
+                - Ask one focused question at a time.
+                - Use company names or document topics.
+                - Reset the session to clear history.
+                """
+            )
+            if st.session_state.query:
+                st.markdown(f"**Last query:** {st.session_state.query}")
+
+        st.markdown("---")
+        st.subheader("🗂️ Conversation History")
+        if chat_history:
+            for chat in chat_history:
+                if chat["role"] == "user":
+                    st.success(f"👤 {chat['content']}")
+                else:
+                    st.info(f"🤖 {chat['content']}")
+                st.markdown("---")
+        else:
+            st.info("Your chat history is empty. Ask a question to begin.")
