@@ -3,187 +3,198 @@ import streamlit as st
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from user_auth import get_user_access
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from user_auth import get_user_access
 
-
-# ------------------- Load Vector Store -------------------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 CHROMA_DIRECTORY = os.path.join(BASE_DIR, "..", "chroma_db")
 DATA_DIRECTORY = os.path.join(BASE_DIR, "..", "data")
 
-embedding_model = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-base-en-v1.5",
-    model_kwargs={"device": "cpu"}
-)
 
-document_store = Chroma(
-    persist_directory=CHROMA_DIRECTORY,
-    embedding_function=embedding_model
-)
+@st.cache_resource(show_spinner="Loading embedding model…")
+def get_embedding_model():
+    return HuggingFaceEmbeddings(
+        model_name="BAAI/bge-base-en-v1.5",
+        model_kwargs={"device": "cpu"},
+    )
 
 
-# ------------------- Load Document Chunks -------------------
-company_documents = {}
-all_documents = []
+@st.cache_resource(show_spinner="Connecting to vector store…")
+def get_document_store(_embedding_model):
+    return Chroma(
+        persist_directory=CHROMA_DIRECTORY,
+        embedding_function=_embedding_model,
+    )
 
-for filename in os.listdir(DATA_DIRECTORY):
-    if filename.lower().endswith(".pdf"):
+
+def _indexed_companies(store) -> set:
+    try:
+        result = store._collection.get(include=["metadatas"])
+        return {m.get("company", "") for m in result["metadatas"] if m.get("company")}
+    except Exception:
+        return set()
+
+
+def ensure_indexed(store):
+    already = _indexed_companies(store)
+    new_docs = []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+
+    for filename in os.listdir(DATA_DIRECTORY):
+        if not filename.lower().endswith(".pdf"):
+            continue
         company_name = os.path.splitext(filename)[0].strip()
+        if company_name in already:
+            continue
         file_path = os.path.join(DATA_DIRECTORY, filename)
-
         loader = PyPDFLoader(file_path)
-        pages = loader.load()
+        for page_num, page in enumerate(loader.load(), start=1):
+            for chunk in splitter.split_documents([page]):
+                new_docs.append(Document(
+                    page_content=chunk.page_content,
+                    metadata={
+                        "source": file_path,
+                        "company": company_name,
+                        "page": page_num,
+                    },
+                ))
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
-        )
-        document_chunks = splitter.split_documents(pages)
-
-        company_documents[company_name] = document_chunks
-        for chunk in document_chunks:
-            all_documents.append(Document(
-                page_content=chunk.page_content,
-                metadata={"source": file_path, "company": company_name}
-            ))
-
-store_is_empty = True
-try:
-    store_is_empty = document_store._collection.count() == 0
-except Exception:
-    store_is_empty = not os.path.exists(CHROMA_DIRECTORY) or not os.listdir(CHROMA_DIRECTORY)
-
-if store_is_empty and all_documents:
-    document_store.add_documents(all_documents)
+    if new_docs:
+        store.add_documents(new_docs)
 
 
-# ------------------- Search Function -------------------
-def search(query, authorized_companies, k=5):
-    search_hits = document_store.similarity_search(query, k=k)
-
-    filtered_results = []
-    for hit in search_hits:
-        hit_metadata = hit.metadata
-        source_path = hit_metadata.get('source', '')
-
-        company_name = os.path.basename(source_path).split(".")[0].strip()
-
-        if company_name in authorized_companies:
-            filtered_results.append({
-                "company": company_name,
-                "content": hit.page_content
+def search(store, query: str, authorized_companies: list, k: int = 5) -> list:
+    hits = store.similarity_search_with_relevance_scores(query, k=k * 4)
+    results = []
+    for doc, score in hits:
+        company = doc.metadata.get("company", "")
+        if company in authorized_companies:
+            results.append({
+                "company": company,
+                "content": doc.page_content,
+                "page": doc.metadata.get("page", "?"),
+                "score": round(score, 3),
             })
+        if len(results) >= k:
+            break
+    return results
 
-    return filtered_results
+
+def init_session():
+    for key, val in {
+        "chat_histories": {},
+        "last_results": [],
+        "last_query": "",
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
 
-# ------------------- Streamlit UI -------------------
-st.set_page_config(page_title="Enterprise Document Intelligence Platform", page_icon="🏢", layout="wide")
-st.title("🏢 Enterprise Document Intelligence Platform")
-st.markdown(
-    """
-    Welcome to the Enterprise Document Intelligence platform. Login with your corporate email to search authorized transcripts,
-    find relevant excerpts, and keep a history of your questions.
-    """
+st.set_page_config(
+    page_title="Enterprise Document Intelligence",
+    page_icon="🏢",
+    layout="wide",
 )
 
-# Sidebar login and status
+init_session()
+embedding_model = get_embedding_model()
+document_store = get_document_store(embedding_model)
+ensure_indexed(document_store)
+
+st.title("🏢 Enterprise Document Intelligence Platform")
+
 st.sidebar.header("User Login")
-st.sidebar.write("Sign in to access your authorized transcripts and document intelligence tools.")
-user_email = st.sidebar.text_input("Email", value="", placeholder="name@example.com")
+st.sidebar.write("Sign in with your corporate email to access authorized transcripts.")
+user_email = st.sidebar.text_input("Email", placeholder="name@example.com").strip().lower()
 
-if "chat_histories" not in st.session_state:
-    st.session_state.chat_histories = {}
-if "query" not in st.session_state:
-    st.session_state.query = ""
-if "last_results" not in st.session_state:
+if not user_email:
+    st.info("Enter your corporate email in the sidebar to begin.")
+    st.stop()
+
+authorized_companies = get_user_access(user_email)
+
+if not authorized_companies:
+    st.sidebar.error("❌ Access Denied. No documents available for this account.")
+    st.error("Your account has no authorized documents. Contact your administrator.")
+    st.stop()
+
+st.sidebar.success("✅ Access Granted")
+st.sidebar.markdown("**Authorized Documents**")
+for company in authorized_companies:
+    st.sidebar.write(f"• {company}")
+st.sidebar.markdown("---")
+
+chat_history = st.session_state.chat_histories.setdefault(user_email, [])
+
+if st.sidebar.button("Reset Session"):
+    st.session_state.chat_histories[user_email] = []
     st.session_state.last_results = []
+    st.session_state.last_query = ""
+    st.rerun()
 
-if user_email:
-    authorized_companies = get_user_access(user_email)
+st.sidebar.info("Ask about earnings, strategy, risks, or topics in your authorized documents.")
 
-    if not authorized_companies:
-        st.sidebar.error("❌ Access Denied. No documents available for this user.")
-    else:
-        st.sidebar.success("✅ Access Granted")
-        st.sidebar.markdown("**Authorized Documents**")
-        for company in authorized_companies:
-            st.sidebar.write(f"- {company}")
-        st.sidebar.markdown("---")
-        if st.sidebar.button("Reset Session"):
-            st.session_state.chat_histories[user_email] = []
-            st.session_state.last_results = []
-            st.session_state.query = ""
-            st.sidebar.success("Session reset. You can start fresh.")
-        st.sidebar.info("Ask about earnings, strategy, risks, or other topics covered in your authorized documents.")
+search_tab, history_tab = st.tabs(["🔎 Search", "🗂 History"])
 
-        if user_email not in st.session_state.chat_histories:
-            st.session_state.chat_histories[user_email] = []
+with search_tab:
+    st.subheader(f"Query: {', '.join(authorized_companies)}")
 
-        chat_history = st.session_state.chat_histories[user_email]
+    with st.form("query_form"):
+        query = st.text_input(
+            "Enter your question",
+            value=st.session_state.last_query,
+            placeholder="What are the latest earnings highlights?",
+        )
+        col_k, col_btn = st.columns([1, 4])
+        with col_k:
+            k = st.slider("Results", min_value=1, max_value=10, value=5)
+        with col_btn:
+            submitted = st.form_submit_button("Search", use_container_width=True)
 
-        left_col, right_col = st.columns((2.5, 1))
+    if submitted:
+        if query.strip():
+            st.session_state.last_query = query
+            with st.spinner("Searching…"):
+                results = search(document_store, query, authorized_companies, k=k)
+            st.session_state.last_results = results
 
-        with left_col:
-            st.subheader(f"🔎 Query Documents ({', '.join(authorized_companies)})")
-            with st.form(key="query_form"):
-                query = st.text_input(
-                    "Enter your question",
-                    value=st.session_state.query,
-                    placeholder="What are the latest earnings highlights?"
-                )
-                search_button = st.form_submit_button("Search")
-
-                if search_button:
-                    st.session_state.query = query
-                    if query.strip():
-                        chat_history.append({"role": "user", "content": query})
-                        search_results = search(query, authorized_companies)
-                        st.session_state.last_results = search_results
-
-                        if search_results:
-                            for result in search_results:
-                                chat_history.append({"role": "assistant", "content": result['content']})
-                        else:
-                            st.warning("No relevant information found.")
-                            chat_history.append({"role": "assistant", "content": "No relevant information found."})
-                    else:
-                        st.warning("Please enter a question before searching.")
-
-            st.markdown("---")
-            st.subheader("📄 Search Results")
-            if st.session_state.last_results:
-                for result in st.session_state.last_results:
-                    with st.expander(f"{result['company']}", expanded=False):
-                        st.write(result['content'])
+            chat_history.append({"role": "user", "content": query})
+            if results:
+                for r in results:
+                    chat_history.append({"role": "assistant", "content": r["content"]})
             else:
-                st.info("Search results will appear here after you submit a query.")
-
-        with right_col:
-            st.subheader("📌 Quick Overview")
-            st.metric("Authorized Documents", len(authorized_companies))
-            st.metric("History Entries", len(chat_history))
-            st.markdown(
-                """
-                **Tips:**
-                - Ask one focused question at a time.
-                - Use company names or document topics.
-                - Reset the session to clear history.
-                """
-            )
-            if st.session_state.query:
-                st.markdown(f"**Last query:** {st.session_state.query}")
-
-        st.markdown("---")
-        st.subheader("🗂️ Conversation History")
-        if chat_history:
-            for chat in chat_history:
-                if chat["role"] == "user":
-                    st.success(f"👤 {chat['content']}")
-                else:
-                    st.info(f"🤖 {chat['content']}")
-                st.markdown("---")
+                chat_history.append({"role": "assistant", "content": "No relevant information found."})
         else:
-            st.info("Your chat history is empty. Ask a question to begin.")
+            st.warning("Please enter a question before searching.")
+
+    st.markdown("---")
+    st.subheader("📄 Search Results")
+    if st.session_state.last_results:
+        for i, r in enumerate(st.session_state.last_results, 1):
+            label = f"{i}. **{r['company']}** — page {r['page']} — relevance {r['score']:.0%}"
+            with st.expander(label, expanded=(i == 1)):
+                st.write(r["content"])
+    elif st.session_state.last_query:
+        st.warning("No relevant excerpts found in your authorized documents.")
+    else:
+        st.info("Search results will appear here after you submit a query.")
+
+    st.markdown("---")
+    m1, m2 = st.columns(2)
+    m1.metric("Authorized Documents", len(authorized_companies))
+    m2.metric("History Entries", len(chat_history))
+    if st.session_state.last_query:
+        st.caption(f"Last query: {st.session_state.last_query}")
+
+with history_tab:
+    st.subheader("Conversation History")
+    if not chat_history:
+        st.info("Your chat history is empty. Ask a question in the Search tab to begin.")
+    else:
+        st.caption(f"{len(chat_history)} entries")
+        for entry in chat_history:
+            if entry["role"] == "user":
+                st.chat_message("user").write(entry["content"])
+            else:
+                st.chat_message("assistant").write(entry["content"])

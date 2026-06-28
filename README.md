@@ -10,10 +10,13 @@ A Python-based web application for secure, multi-user document search with **rol
 
 *  **Multi-user login with document-level access control**
 *  **Semantic search** using `BAAI/bge-base-en-v1.5` embeddings (109M, rank-aware, CPU-friendly)
-*  **Conversational Q\&A** with chat history maintained per user
+*  **Conversational Q\&A** with chat history per user, displayed in a dedicated History tab
 *  **ChromaDB** vector store for fast and efficient retrieval
 *  **Fully offline and runs on CPU** (No OpenAI required)
-*  **Simple UI** with Streamlit
+*  **Tabbed UI** — Search and History tabs via Streamlit
+*  **Relevance scores and page numbers** shown per result excerpt
+*  **Incremental indexing** — only new PDFs are embedded on startup; existing index is reused
+*  **Cached model and store loading** — embedding model and vector store initialise once per server session
 
 ---
 
